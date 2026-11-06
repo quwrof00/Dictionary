@@ -1,5 +1,88 @@
-import { useEffect, useState } from "react"
+import { useEffect, useState, useCallback, useMemo } from "react"
 import { THEMES, type ThemeId, DEFAULT_THEME } from "./theme"
+
+// ─── Constants & Pre-compiled Expressions (Constant Folding & Code Motion) ───
+
+const STORAGE_PREFS_KEY = "pdfjs.preferences"
+const MOZILLA_VIEWER_URL = "https://mozilla.github.io/pdf.js/web/viewer.html"
+
+const PDF_EXT_REGEX = /\.pdf($|[?#])/i
+const PDF_PATH_REGEX = /\/pdf/i
+const FILE_PROTO_REGEX = /^file:\/\//i
+const HTTP_PROTO_REGEX = /^https?:\/\//i
+const NESTED_PARAM_KEYS = ["file", "src", "url"] as const
+
+const CSS_SNIPPET = `
+.wordlens-btn { transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1); }
+.wordlens-btn:hover { background: #e5e5e5 !important; color: #111111 !important; box-shadow: 0 4px 16px rgba(255,255,255,0.16) !important; transform: translateY(-1px); }
+.wordlens-btn:active { transform: translateY(0); }
+`
+
+const CONTAINER_STYLE: React.CSSProperties = {
+  width: "320px",
+  padding: "20px",
+  background: "#111111",
+  color: "#F5F5F5",
+  fontFamily: "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
+  boxShadow: "0 20px 40px rgba(0,0,0,0.5)",
+  border: "1px solid rgba(255,255,255,0.08)",
+  borderRadius: "16px"
+}
+
+const SECTION_CARD_STYLE: React.CSSProperties = {
+  background: "#1a1a1a",
+  border: "1px solid rgba(255,255,255,0.08)",
+  padding: "14px",
+  borderRadius: "12px",
+  marginBottom: "16px"
+}
+
+// ─── Helper Functions (Common Subexpression Elimination & Pure Helpers) ──────
+
+function getPdfFilename(url: string): string {
+  try {
+    const decodedUrl = decodeURIComponent(url)
+    const qIndex = decodedUrl.indexOf("?")
+    const cleanPath = qIndex !== -1 ? decodedUrl.slice(0, qIndex) : decodedUrl
+    const slashIndex = cleanPath.lastIndexOf("/")
+    return slashIndex !== -1 ? cleanPath.slice(slashIndex + 1) || "document.pdf" : cleanPath || "document.pdf"
+  } catch {
+    return "document.pdf"
+  }
+}
+
+function resolveRemotePdfUrl(url: string): string {
+  if (!url) return ""
+  try {
+    const parsed = new URL(url)
+    const isHttp = HTTP_PROTO_REGEX.test(parsed.protocol)
+
+    if (isHttp && (PDF_EXT_REGEX.test(parsed.pathname) || PDF_PATH_REGEX.test(parsed.pathname))) {
+      return parsed.toString()
+    }
+
+    const params = parsed.searchParams
+    for (let i = 0, len = NESTED_PARAM_KEYS.length; i < len; i++) {
+      const nested = params.get(NESTED_PARAM_KEYS[i])
+      if (!nested) continue
+      try {
+        const nestedUrl = new URL(decodeURIComponent(nested))
+        if (HTTP_PROTO_REGEX.test(nestedUrl.protocol)) {
+          return nestedUrl.toString()
+        }
+      } catch {
+        continue
+      }
+    }
+  } catch {
+    return ""
+  }
+  return ""
+}
+
+function getHostedMozillaViewerUrl(source?: string): string {
+  return source ? `${MOZILLA_VIEWER_URL}?file=${encodeURIComponent(source)}` : MOZILLA_VIEWER_URL
+}
 
 function IndexPopup() {
   const [activeTabUrl, setActiveTabUrl] = useState("")
@@ -10,15 +93,17 @@ function IndexPopup() {
 
   // Fetch user settings from Chrome storage when popup opens
   useEffect(() => {
+    let isMounted = true
     const fetchSettings = async () => {
       const result = await chrome.storage.local.get(["pdfTheme", "mwApiKey", "pdfDarkTheme"])
-      // Migrate old pdfDarkTheme if it exists
+      if (!isMounted) return
+
       if (result.pdfTheme) {
         setCurrentTheme(result.pdfTheme as ThemeId)
       } else if (result.pdfDarkTheme !== undefined) {
-        const migrated = result.pdfDarkTheme ? "dark-slate" : "light"
+        const migrated: ThemeId = result.pdfDarkTheme ? "dark-slate" : "light"
         setCurrentTheme(migrated)
-        await chrome.storage.local.set({ pdfTheme: migrated })
+        chrome.storage.local.set({ pdfTheme: migrated })
       }
 
       if (result.mwApiKey !== undefined) {
@@ -26,26 +111,26 @@ function IndexPopup() {
       }
     }
     fetchSettings()
+    return () => { isMounted = false }
   }, [])
 
   // Save the Merriam-Webster API key to Chrome storage
-  const handleSaveApiKey = async () => {
+  const handleSaveApiKey = useCallback(async () => {
     await chrome.storage.local.set({ mwApiKey })
     setApiSaveStatus("Saved!")
     setTimeout(() => setApiSaveStatus(""), 2000)
-  }
+  }, [mwApiKey])
 
   // Update theme in Chrome storage and directly inside PDF.js local storage
-  const handleThemeChange = (newThemeId: ThemeId) => {
+  const handleThemeChange = useCallback((newThemeId: ThemeId) => {
     setCurrentTheme(newThemeId)
     chrome.storage.local.set({ pdfTheme: newThemeId })
     try {
-      const themeConfig = THEMES[newThemeId]
-      const storageKey = "pdfjs.preferences"
-      const existing = localStorage.getItem(storageKey)
+      const themeConfig = THEMES[newThemeId] || THEMES[DEFAULT_THEME]
+      const existing = localStorage.getItem(STORAGE_PREFS_KEY)
       const parsed = existing ? JSON.parse(existing) : {}
       localStorage.setItem(
-        storageKey,
+        STORAGE_PREFS_KEY,
         JSON.stringify({
           ...parsed,
           viewerCssTheme: themeConfig.isDark ? 2 : 1,
@@ -55,80 +140,28 @@ function IndexPopup() {
         })
       )
     } catch { }
-  }
+  }, [])
 
   // Get the URL of the user's currently active browser tab
   useEffect(() => {
-    const fetchActiveTab = async () => {
-      if (typeof chrome !== "undefined" && chrome.tabs) {
-        const tabs = await chrome.tabs.query({ active: true, currentWindow: true })
+    if (typeof chrome !== "undefined" && chrome.tabs) {
+      chrome.tabs.query({ active: true, currentWindow: true }).then(tabs => {
         if (tabs && tabs[0]?.url) {
           setActiveTabUrl(tabs[0].url)
         }
-      }
+      })
     }
-    fetchActiveTab()
   }, [])
 
-  const getPdfFilename = (url: string) => {
-    try {
-      const decodedUrl = decodeURIComponent(url)
-      const parts = decodedUrl.split("/")
-      const lastPart = parts[parts.length - 1]
-      return lastPart.split("?")[0] || "document.pdf"
-    } catch {
-      return "document.pdf"
-    }
-  }
+  // Memoized subexpression derivations
+  const { isPdf, isLocalPdf, pdfFilename } = useMemo(() => {
+    const isPdfUrl = PDF_EXT_REGEX.test(activeTabUrl) || PDF_PATH_REGEX.test(activeTabUrl)
+    const isLocal = FILE_PROTO_REGEX.test(activeTabUrl)
+    const filename = isPdfUrl ? getPdfFilename(activeTabUrl) : ""
+    return { isPdf: isPdfUrl, isLocalPdf: isLocal, pdfFilename: filename }
+  }, [activeTabUrl])
 
-  const isPdf =
-    activeTabUrl.toLowerCase().endsWith(".pdf") ||
-    activeTabUrl.toLowerCase().includes(".pdf?") ||
-    activeTabUrl.toLowerCase().includes("/pdf")
-  const isLocalPdf = activeTabUrl.toLowerCase().startsWith("file://")
-  const pdfFilename = isPdf ? getPdfFilename(activeTabUrl) : ""
-
-  // Extract the true PDF URL if it is nested inside another viewer's URL
-  const resolveRemotePdfUrl = (url: string) => {
-    if (!url) return ""
-
-    try {
-      const parsed = new URL(url)
-      if (parsed.protocol === "http:" || parsed.protocol === "https:") {
-        if (
-          parsed.pathname.toLowerCase().endsWith(".pdf") ||
-          parsed.pathname.toLowerCase().includes("/pdf")
-        ) {
-          return parsed.toString()
-        }
-      }
-
-      for (const key of ["file", "src", "url"]) {
-        const nested = parsed.searchParams.get(key)
-        if (!nested) continue
-
-        try {
-          const nestedUrl = new URL(decodeURIComponent(nested))
-          if (nestedUrl.protocol === "http:" || nestedUrl.protocol === "https:") {
-            return nestedUrl.toString()
-          }
-        } catch {
-          continue
-        }
-      }
-    } catch {
-      return ""
-    }
-
-    return ""
-  }
-
-  const getHostedMozillaViewerUrl = (source?: string) => {
-    const viewerUrl = "https://mozilla.github.io/pdf.js/web/viewer.html"
-    return source ? `${viewerUrl}?file=${encodeURIComponent(source)}` : viewerUrl
-  }
-
-  const handleOpenPdfReader = async () => {
+  const handleOpenPdfReader = useCallback(() => {
     try {
       if (isLocalPdf) {
         chrome.tabs.create({ url: getHostedMozillaViewerUrl() })
@@ -142,7 +175,6 @@ function IndexPopup() {
           setTimeout(() => setPdfError(""), 2200)
           return
         }
-
         chrome.tabs.create({ url: getHostedMozillaViewerUrl(source) })
         return
       }
@@ -152,95 +184,32 @@ function IndexPopup() {
       setPdfError("Failed to open the PDF viewer.")
       setTimeout(() => setPdfError(""), 2200)
     }
-  }
+  }, [isLocalPdf, isPdf, activeTabUrl])
 
   return (
-    <div
-      style={{
-        width: "320px",
-        padding: "20px",
-        background: "#111111",
-        color: "#F5F5F5",
-        fontFamily: "'Inter', system-ui, -apple-system, sans-serif",
-        boxShadow: "0 20px 40px rgba(0,0,0,0.5)",
-        border: "1px solid rgba(255,255,255,0.08)",
-        borderRadius: "16px"
-      }}>
-      <style
-        dangerouslySetInnerHTML={{
-          __html: `
-            @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
-            .wordlens-btn {
-              transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
-            }
-            .wordlens-btn:hover {
-              background: #e5e5e5 !important;
-              color: #111111 !important;
-              box-shadow: 0 4px 16px rgba(255,255,255,0.16) !important;
-              transform: translateY(-1px);
-            }
-            .wordlens-btn:active {
-              transform: translateY(0);
-            }
-          `
-        }}
-      />
+    <div style={CONTAINER_STYLE}>
+      <style dangerouslySetInnerHTML={{ __html: CSS_SNIPPET }} />
 
+      {/* Header */}
       <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "16px" }}>
-        <svg
-          width="24"
-          height="24"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="#86EFAC"
-          strokeWidth="2.5"
-          strokeLinecap="round"
-          strokeLinejoin="round">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#86EFAC" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
           <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" />
         </svg>
         <div>
-          <h1
-            style={{
-              margin: 0,
-              fontSize: "14px",
-              fontWeight: "800",
-              color: "#F5F5F5",
-              letterSpacing: "0.08em",
-              textTransform: "uppercase"
-            }}>
+          <h1 style={{ margin: 0, fontSize: "14px", fontWeight: "800", color: "#F5F5F5", letterSpacing: "0.08em", textTransform: "uppercase" }}>
             WordLens
           </h1>
-          <p
-            style={{
-              margin: 0,
-              fontSize: "10px",
-              color: "#86EFAC",
-              fontWeight: "600",
-              letterSpacing: "0.02em"
-            }}>
+          <p style={{ margin: 0, fontSize: "10px", color: "#86EFAC", fontWeight: "600", letterSpacing: "0.02em" }}>
             Read without breaking focus.
           </p>
         </div>
       </div>
 
-      <div
-        style={{
-          height: "1px",
-          backgroundColor: "rgba(255,255,255,0.08)",
-          marginBottom: "16px"
-        }}
-      />
+      <div style={{ height: "1px", backgroundColor: "rgba(255,255,255,0.08)", marginBottom: "16px" }} />
 
+      {/* Shortcuts */}
       <div style={{ marginBottom: "20px" }}>
-        <h3
-          style={{
-            fontSize: "10px",
-            fontWeight: "700",
-            textTransform: "uppercase",
-            letterSpacing: "0.1em",
-            color: "#a3a3a3",
-            margin: "0 0 10px 0"
-          }}>
+        <h3 style={{ fontSize: "10px", fontWeight: "700", textTransform: "uppercase", letterSpacing: "0.1em", color: "#a3a3a3", margin: "0 0 10px 0" }}>
           Usage Shortcuts
         </h3>
         <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
@@ -251,19 +220,7 @@ function IndexPopup() {
           <div style={{ display: "flex", alignItems: "flex-start", gap: "8px", fontSize: "11px", color: "#d4d4d4" }}>
             <span style={{ color: "#86EFAC", fontWeight: "600" }}>•</span>
             <span>
-              Press{" "}
-              <strong
-                style={{
-                  color: "#f5f5f5",
-                  background: "#1f1f1f",
-                  padding: "2px 6px",
-                  borderRadius: "4px",
-                  border: "1px solid rgba(255,255,255,0.1)",
-                  fontWeight: "600"
-                }}>
-                D
-              </strong>{" "}
-              to open definitions instantly.
+              Press <strong style={{ color: "#f5f5f5", background: "#1f1f1f", padding: "2px 6px", borderRadius: "4px", border: "1px solid rgba(255,255,255,0.1)", fontWeight: "600" }}>D</strong> to open definitions instantly.
             </span>
           </div>
           <div style={{ display: "flex", alignItems: "flex-start", gap: "8px", fontSize: "11px", color: "#d4d4d4" }}>
@@ -273,22 +230,9 @@ function IndexPopup() {
         </div>
       </div>
 
-      <div
-        style={{
-          background: "#1a1a1a",
-          border: "1px solid rgba(255,255,255,0.08)",
-          padding: "14px",
-          borderRadius: "12px",
-          marginBottom: "16px"
-        }}>
-        <h4
-          style={{
-            margin: "0 0 6px 0",
-            fontSize: "12px",
-            fontWeight: "700",
-            color: "#F5F5F5",
-            letterSpacing: "0.02em"
-          }}>
+      {/* Merriam-Webster API Key */}
+      <div style={SECTION_CARD_STYLE}>
+        <h4 style={{ margin: "0 0 6px 0", fontSize: "12px", fontWeight: "700", color: "#F5F5F5", letterSpacing: "0.02em" }}>
           Dictionary API
         </h4>
         <p style={{ margin: "0 0 10px 0", fontSize: "11px", color: "#d4d4d4", lineHeight: "1.4" }}>
@@ -329,21 +273,9 @@ function IndexPopup() {
         </div>
       </div>
 
-      <div
-        style={{
-          background: "#1a1a1a",
-          border: "1px solid rgba(255,255,255,0.08)",
-          padding: "14px",
-          borderRadius: "12px"
-        }}>
-        <h4
-          style={{
-            margin: "0 0 6px 0",
-            fontSize: "12px",
-            fontWeight: "700",
-            color: "#F5F5F5",
-            letterSpacing: "0.02em"
-          }}>
+      {/* PDF.js Viewer Options */}
+      <div style={{ background: "#1a1a1a", border: "1px solid rgba(255,255,255,0.08)", padding: "14px", borderRadius: "12px" }}>
+        <h4 style={{ margin: "0 0 6px 0", fontSize: "12px", fontWeight: "700", color: "#F5F5F5", letterSpacing: "0.02em" }}>
           PDF.js Viewer
         </h4>
 
@@ -437,27 +369,14 @@ function IndexPopup() {
             gap: "8px",
             borderRadius: "8px"
           }}>
-          <svg
-            width="14"
-            height="14"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2.5">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
             <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
           </svg>
           {isPdf ? "Open Active PDF In PDF.js" : "Open PDF Viewer"}
         </button>
       </div>
 
-      <div
-        style={{
-          marginTop: "16px",
-          textAlign: "center",
-          fontSize: "9px",
-          color: "#737373",
-          letterSpacing: "0.02em"
-        }}>
+      <div style={{ marginTop: "16px", textAlign: "center", fontSize: "9px", color: "#737373", letterSpacing: "0.02em" }}>
         Press <strong style={{ color: "#f5f5f5" }}>Esc</strong> to dismiss active dictionary overlays.
       </div>
     </div>

@@ -18,7 +18,6 @@ WordLens is a Chromium browser extension built with Plasmo and React. It lets yo
 - [Plasmo](https://docs.plasmo.com/)
 - React 18
 - TypeScript
-- PDF.js (`pdfjs-dist`)
 
 ## Requirements
 
@@ -175,19 +174,18 @@ The output can then be used for manual packaging or browser store submission.
 The extension currently requests:
 
 - `activeTab`
-- `tabs`
 - `storage`
 
-It also declares host access for:
+It also declares scoped host permissions for:
 
-- `https://*/*`
-- `http://*/*`
-- `file://*/*`
+- `https://*.dictionaryapi.com/*`
+- `https://api.dictionaryapi.dev/*`
+- `https://*.wiktionary.org/*`
 
 These are used so WordLens can:
 
-- Detect the active tab URL
-- Open the PDF viewer flow
+- Query definitions from Merriam-Webster, Free Dictionary API, and Wiktionary
+- Read and apply user preferences and theme settings securely
 - Store user settings such as theme and API key
 - Work on websites and support local file PDF access where applicable
 

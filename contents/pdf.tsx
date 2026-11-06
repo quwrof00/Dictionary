@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState } from "react"
+import { useEffect, useRef, useState, useCallback } from "react"
 import type { PlasmoCSConfig, PlasmoGetRootContainer } from "plasmo"
-import { THEMES, type ThemeId, DEFAULT_THEME } from "../theme"
+import { THEMES, type ThemeId, DEFAULT_THEME, type ThemeColors } from "../theme"
 
 // Injects dictionary popup on all websites except native PDFs.
 
@@ -12,35 +12,93 @@ export const config: PlasmoCSConfig = {
   ]
 }
 
+// ─── Constants & Pre-compiled Expressions (Constant Folding & Code Motion) ───
+
+const HOST_ID = "wordlens-csui-host"
+const HOST_STYLE = "position:fixed;top:0;left:0;width:0;height:0;z-index:2147483647;pointer-events:none;overflow:visible;"
+
+const CARD_WIDTH = 320
+const CARD_MAX_HEIGHT = 350
+const CARD_OFFSET_Y = 10
+const BUTTON_OFFSET_Y = 12
+const BUTTON_SAFE_PADDING = 26
+const EDGE_PADDING = 10
+
+const STORAGE_PREFS_KEY = "pdfjs.preferences"
+const MOZILLA_HOST = "mozilla.github.io"
+const MOZILLA_VIEWER_PATH = "/pdf.js/web/viewer.html"
+
+const MW_API_BASE = "https://www.dictionaryapi.com/api/v3/references/collegiate/json/"
+const FREE_DICT_BASE = "https://api.dictionaryapi.dev/api/v2/entries/en/"
+const WIKTIONARY_BASE = "https://en.wiktionary.org/api/rest_v1/page/definition/"
+
+const CLEAN_WORD_REGEX = /[.,\/#!$%\^&\*;:{}=\-_`~()?\d]/g
+const WORD_TOKEN_REGEX = /\w+/
+const TOKEN_SPLIT_REGEX = /(\s+|[.,\/#!$%\^&\*;:{}=\-_`~()?]+)/
+const WHITESPACE_REGEX = /\s+/
+const TAG_STRIP_REGEX = /<[^>]*>/g
+const PDF_EXT_REGEX = /\.pdf($|[?#])/i
+
+const CSS_STYLES = `
+@keyframes plasmoFadeIn { from { opacity:0; transform:translateY(4px) scale(0.96); } to { opacity:1; transform:translateY(0) scale(1); } }
+@keyframes pulseGlow { 0% { box-shadow: 0 0 0 0 rgba(134,239,172,0.4); } 70% { box-shadow: 0 0 0 6px rgba(134,239,172,0); } 100% { box-shadow: 0 0 0 0 rgba(134,239,172,0); } }
+@keyframes spin { to { transform:rotate(360deg); } }
+.dictionary-loader { width:18px; height:18px; border:2px solid rgba(255,255,255,0.15); border-radius:50%; border-top-color:#ffffff; animation:spin 0.8s linear infinite; display:inline-block; }
+.plasmo-word-token { cursor:pointer; padding:2px 6px; border-radius:6px; transition:all 0.15s ease; display:inline-block; background-color:rgba(255,255,255,0.03); }
+.plasmo-word-token:hover { background-color:#ffffff !important; color:#0F172A !important; }
+`
+
+const CONTAINER_STYLE: React.CSSProperties = { display: "contents", pointerEvents: "auto" }
+
+// ─── Pure Geometry & Positioning Helpers ─────────────────────────────────────
+
+function calculateCardPosition(rect: DOMRect, winWidth: number, winHeight: number): { x: number; y: number } {
+  let x = rect.left
+  if (x + CARD_WIDTH > winWidth) {
+    x = winWidth - CARD_WIDTH - 20
+  }
+  return {
+    x: Math.max(EDGE_PADDING, x),
+    y: Math.min(rect.bottom + CARD_OFFSET_Y, winHeight - CARD_MAX_HEIGHT)
+  }
+}
+
+function calculateButtonPosition(rect: DOMRect, winWidth: number, winHeight: number): { x: number; y: number } {
+  const centerX = rect.left + rect.width * 0.5
+  return {
+    x: Math.max(BUTTON_SAFE_PADDING, Math.min(centerX, winWidth - BUTTON_SAFE_PADDING)),
+    y: Math.min(winHeight - 48, rect.bottom + BUTTON_OFFSET_Y)
+  }
+}
+
+function isHostedMozillaViewer(loc: Location = window.location): boolean {
+  return loc.hostname === MOZILLA_HOST && loc.pathname.includes(MOZILLA_VIEWER_PATH)
+}
+
 export const getRootContainer: PlasmoGetRootContainer = () => {
   if (typeof document === "undefined" || !document.documentElement) return null
 
-  const isHostedMozillaViewer =
-    window.location.hostname === "mozilla.github.io" &&
-    window.location.pathname.includes("/pdf.js/web/viewer.html")
-
   // Skip raw PDF tabs — they have no standard HTML body
+  const isMozilla = isHostedMozillaViewer()
+  const href = window.location.href
   const isNativePdf =
     document.contentType === "application/pdf" ||
-    window.location.pathname.toLowerCase().endsWith(".pdf") ||
-    window.location.href.toLowerCase().includes(".pdf?")
-  if (isNativePdf && !isHostedMozillaViewer) return null
+    PDF_EXT_REGEX.test(window.location.pathname) ||
+    PDF_EXT_REGEX.test(href)
+
+  if (isNativePdf && !isMozilla) return null
 
   // Skip our own extension pages
-  if (
-    window.location.protocol === "chrome-extension:" ||
-    window.location.protocol === "edge-extension:"
-  ) return null
+  const protocol = window.location.protocol
+  if (protocol === "chrome-extension:" || protocol === "edge-extension:") return null
 
-  // Create a transparent container for the Plasmo Shadow DOM UI.
-  const existing = document.getElementById("wordlens-csui-host")
+  // Create a transparent container for the Plasmo Shadow DOM UI
+  const existing = document.getElementById(HOST_ID)
   if (existing) return existing
 
   const host = document.createElement("div")
-  host.id = "wordlens-csui-host"
-  // Zero-size, non-interactive, always on top — completely transparent to page layout
-  host.style.cssText =
-    "position:fixed;top:0;left:0;width:0;height:0;z-index:2147483647;pointer-events:none;overflow:visible;"
+  host.id = HOST_ID
+  host.style.cssText = HOST_STYLE
   document.documentElement.appendChild(host)
   return host
 }
@@ -67,36 +125,36 @@ export default function PdfOverlay() {
   const [error, setError] = useState("")
   const [definition, setDefinition] = useState<DefinitionData | null>(null)
   const [currentTheme, setCurrentTheme] = useState<ThemeId>(DEFAULT_THEME)
-  const containerRef = useRef<HTMLDivElement>(null)
+
+  // Mutable refs to prevent re-binding document listeners on every render
+  const showCardRef = useRef(showCard)
+  showCardRef.current = showCard
+  const selectedTextRef = useRef(selectedText)
+  selectedTextRef.current = selectedText
 
   // Sync dark mode themes with PDF.js viewer
   useEffect(() => {
-    const isHostedMozillaViewer =
-      window.location.hostname === "mozilla.github.io" &&
-      window.location.pathname.includes("/pdf.js/web/viewer.html")
-
-    if (!isHostedMozillaViewer) return
+    if (!isHostedMozillaViewer()) return
 
     const applyThemeToStorage = (themeId: ThemeId) => {
       try {
-        const themeConfig = THEMES[themeId]
-        const storageKey = "pdfjs.preferences"
-        const existing = window.localStorage.getItem(storageKey)
+        const themeConfig = THEMES[themeId] || THEMES[DEFAULT_THEME]
+        const existing = window.localStorage.getItem(STORAGE_PREFS_KEY)
         const parsed = existing ? JSON.parse(existing) : {}
 
-        const newPrefs = {
-          ...parsed,
-          viewerCssTheme: themeConfig.isDark ? 2 : 1,
-          forcePageColors: true,
-          pageColorsBackground: themeConfig.pdfBg,
-          pageColorsForeground: themeConfig.pdfFg
-        }
-
+        const newViewerCssTheme = themeConfig.isDark ? 2 : 1
         if (
-          parsed.viewerCssTheme !== newPrefs.viewerCssTheme ||
-          parsed.pageColorsBackground !== newPrefs.pageColorsBackground
+          parsed.viewerCssTheme !== newViewerCssTheme ||
+          parsed.pageColorsBackground !== themeConfig.pdfBg
         ) {
-          window.localStorage.setItem(storageKey, JSON.stringify(newPrefs))
+          const newPrefs = {
+            ...parsed,
+            viewerCssTheme: newViewerCssTheme,
+            forcePageColors: true,
+            pageColorsBackground: themeConfig.pdfBg,
+            pageColorsForeground: themeConfig.pdfFg
+          }
+          window.localStorage.setItem(STORAGE_PREFS_KEY, JSON.stringify(newPrefs))
           window.location.reload()
         }
       } catch { }
@@ -104,12 +162,8 @@ export default function PdfOverlay() {
 
     const initTheme = async () => {
       const result = await chrome.storage.local.get(["pdfTheme", "pdfDarkTheme"])
-      let themeId: ThemeId = DEFAULT_THEME
-      if (result.pdfTheme) {
-        themeId = result.pdfTheme as ThemeId
-      } else if (result.pdfDarkTheme !== undefined) {
-        themeId = result.pdfDarkTheme ? "dark-slate" : "light"
-      }
+      const themeId: ThemeId = (result.pdfTheme as ThemeId) ||
+        (result.pdfDarkTheme !== undefined ? (result.pdfDarkTheme ? "dark-slate" : "light") : DEFAULT_THEME)
       setCurrentTheme(themeId)
       applyThemeToStorage(themeId)
     }
@@ -130,59 +184,61 @@ export default function PdfOverlay() {
     return () => chrome.storage.onChanged.removeListener(listener)
   }, [])
 
-  // Fetch definition from APIs
-  const fetchDefinition = async (word: string) => {
+  // Fetch definition from APIs with loop-optimized parser and CSE
+  const fetchDefinition = useCallback(async (word: string) => {
     setLoading(true)
     setError("")
     setDefinition(null)
 
-    const cleanWord = word.replace(/[.,\/#!$%\^&\*;:{}=\-_`~()?1234567890]/g, "").trim()
+    const cleanWord = word.replace(CLEAN_WORD_REGEX, "").trim()
     if (!cleanWord) {
       setError("No valid word selected")
       setLoading(false)
       return
     }
 
-    const getMwKey = async (): Promise<string> => {
-      const res = await chrome.storage.local.get(["mwApiKey"])
-      return res.mwApiKey || ""
-    }
-
-    const mwKey = await getMwKey()
+    const storageRes = await chrome.storage.local.get(["mwApiKey"])
+    const mwKey: string = storageRes.mwApiKey || ""
+    const encodedWord = encodeURIComponent(cleanWord)
 
     if (mwKey) {
       try {
-        const res = await fetch(`https://www.dictionaryapi.com/api/v3/references/collegiate/json/${encodeURIComponent(cleanWord)}?key=${mwKey}`)
+        const res = await fetch(`${MW_API_BASE}${encodedWord}?key=${mwKey}`)
         if (!res.ok) throw new Error("MW Request Failed")
         const data = await res.json()
-        
-        // MW returns an array of objects for an exact match, or an array of strings for suggestions
+
+        // MW returns an array of objects for an exact match
         if (Array.isArray(data) && data.length > 0 && typeof data[0] === "object") {
-          const meaningsMap = new Map<string, any[]>()
+          const meaningsMap = new Map<string, Array<{ definition: string }>>()
           
-          data.forEach((entry: any) => {
+          for (let i = 0, len = data.length; i < len; i++) {
+            const entry = data[i]
+            const defs = entry.shortdef
+            if (!defs || defs.length === 0) continue
+
             const fl = entry.fl || "Definition"
-            const defs = entry.shortdef || []
-            if (defs.length > 0) {
-              if (!meaningsMap.has(fl)) meaningsMap.set(fl, [])
-              const existingDefs = meaningsMap.get(fl)!
-              defs.forEach((d: string) => {
-                existingDefs.push({ definition: d })
-              })
+            let existingDefs = meaningsMap.get(fl)
+            if (!existingDefs) {
+              existingDefs = []
+              meaningsMap.set(fl, existingDefs)
             }
-          })
-          
+            for (let j = 0, dLen = defs.length; j < dLen; j++) {
+              existingDefs.push({ definition: defs[j] })
+            }
+          }
+
           if (meaningsMap.size > 0) {
             const meanings = Array.from(meaningsMap.entries()).map(([fl, defs]) => ({
               partOfSpeech: fl,
               definitions: defs
             }))
-            
-            let phonetic = undefined
-            if (data[0].hwi?.prs?.[0]?.mw) {
-              phonetic = `\\${data[0].hwi.prs[0].mw}\\`
+
+            let phonetic: string | undefined = undefined
+            const firstPr = data[0].hwi?.prs?.[0]?.mw
+            if (firstPr) {
+              phonetic = `\\${firstPr}\\`
             }
-            
+
             setDefinition({
               word: cleanWord,
               phonetic,
@@ -198,32 +254,57 @@ export default function PdfOverlay() {
     }
 
     try {
-      const res = await fetch(`https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(cleanWord)}`)
+      const res = await fetch(`${FREE_DICT_BASE}${encodedWord}`)
       if (!res.ok) throw new Error("Not found")
       const data = await res.json()
-      if (data?.length > 0) setDefinition(data[0])
-      else throw new Error("Empty")
+      if (data?.length > 0) {
+        setDefinition(data[0])
+        setLoading(false)
+        return
+      }
+      throw new Error("Empty")
     } catch {
       // Fallback: Wiktionary
       try {
-        const res2 = await fetch(`https://en.wiktionary.org/api/rest_v1/page/definition/${encodeURIComponent(cleanWord)}`)
+        const res2 = await fetch(`${WIKTIONARY_BASE}${encodedWord}`)
         if (!res2.ok) throw new Error()
         const data2 = await res2.json()
         const en = data2.en
-        if (en?.length > 0) {
-          setDefinition({
-            word: cleanWord,
-            meanings: en.map((e: any) => ({
-              partOfSpeech: e.partOfSpeech || "Definition",
-              definitions: e.definitions
-                .map((d: any) => ({
-                  definition: d.definition?.replace(/<[^>]*>/g, "").trim() || "",
-                  example: d.parsedExamples?.[0]?.example?.replace(/<[^>]*>/g, "").trim()
-                }))
-                .filter((d: any) => d.definition.length > 0)
-            })).filter((m: any) => m.definitions.length > 0)
-          })
-          return
+        const enLen = en ? en.length : 0
+        if (enLen > 0) {
+          const meanings = []
+          for (let i = 0; i < enLen; i++) {
+            const item = en[i]
+            const rawDefs = item.definitions
+            const defsLen = rawDefs ? rawDefs.length : 0
+            const definitions = []
+            for (let j = 0; j < defsLen; j++) {
+              const d = rawDefs[j]
+              const defText = d.definition ? d.definition.replace(TAG_STRIP_REGEX, "").trim() : ""
+              if (defText) {
+                const ex = d.parsedExamples?.[0]?.example
+                definitions.push({
+                  definition: defText,
+                  example: ex ? ex.replace(TAG_STRIP_REGEX, "").trim() : undefined
+                })
+              }
+            }
+            if (definitions.length > 0) {
+              meanings.push({
+                partOfSpeech: item.partOfSpeech || "Definition",
+                definitions
+              })
+            }
+          }
+
+          if (meanings.length > 0) {
+            setDefinition({
+              word: cleanWord,
+              meanings
+            })
+            setLoading(false)
+            return
+          }
         }
         setError("Word not found in vocabulary")
       } catch {
@@ -232,29 +313,37 @@ export default function PdfOverlay() {
     } finally {
       setLoading(false)
     }
-  }
+  }, [])
+
+  const fetchDefRef = useRef(fetchDefinition)
+  fetchDefRef.current = fetchDefinition
 
   // Lookup handler
-  const handleLookup = () => {
-    if (selectedText) {
+  const handleLookup = useCallback(() => {
+    const text = selectedTextRef.current
+    if (text) {
       setShowButton(false)
       setShowCard(true)
-      fetchDefinition(selectedText)
+      fetchDefRef.current(text)
     }
-  }
+  }, [])
 
-  // Event listeners for keyboard/mouse
+  // Event listeners bound once; uses refs to avoid memory & listener churn
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") { setShowCard(false); setShowButton(false); return }
+      if (e.key === "Escape") {
+        setShowCard(false)
+        setShowButton(false)
+        return
+      }
 
       const active = document.activeElement
-      const isTyping =
+      if (
         active &&
         (active.tagName === "INPUT" ||
           active.tagName === "TEXTAREA" ||
           (active as HTMLElement).isContentEditable)
-      if (isTyping) return
+      ) return
 
       if (e.key.toLowerCase() === "d" && !e.ctrlKey && !e.altKey && !e.metaKey) {
         const sel = window.getSelection()
@@ -264,17 +353,11 @@ export default function PdfOverlay() {
             e.preventDefault()
             e.stopPropagation()
             const rect = sel.getRangeAt(0).getBoundingClientRect()
-            const cardWidth = 320
-            // Use viewport-relative coords (no scrollX/Y) — elements use position:fixed
-            let x = rect.left
-            if (rect.left + cardWidth > window.innerWidth)
-              x = window.innerWidth - cardWidth - 20
-            x = Math.max(10, x)
-            setPosition({ x, y: Math.min(rect.bottom + 10, window.innerHeight - 350) })
+            setPosition(calculateCardPosition(rect, window.innerWidth, window.innerHeight))
             setSelectedText(text)
             setShowButton(false)
             setShowCard(true)
-            fetchDefinition(text)
+            fetchDefRef.current(text)
           }
         }
       }
@@ -282,36 +365,39 @@ export default function PdfOverlay() {
 
     const handleMouseUp = (e: MouseEvent) => {
       const path = e.composedPath()
-      const inside = path.some(n =>
-        n instanceof HTMLElement && n.classList.contains("plasmo-dictionary-ignore")
-      )
-      if (inside) return
+      for (let i = 0, pLen = path.length; i < pLen; i++) {
+        const node = path[i]
+        if (node instanceof HTMLElement && node.classList.contains("plasmo-dictionary-ignore")) {
+          return
+        }
+      }
 
       setTimeout(() => {
         const sel = window.getSelection()
-        if (!sel || sel.rangeCount === 0) { setShowCard(false); setShowButton(false); return }
+        if (!sel || sel.rangeCount === 0) {
+          setShowCard(false)
+          setShowButton(false)
+          return
+        }
         const text = sel.toString().trim()
-        if (!text) { setShowCard(false); setShowButton(false); return }
+        if (!text) {
+          setShowCard(false)
+          setShowButton(false)
+          return
+        }
 
         const range = sel.getRangeAt(0)
         const rect = range.getBoundingClientRect()
-        const cardWidth = 320
         setSelectedText(text)
 
-        // Viewport-relative coords — all floating elements use position:fixed
-        if (showCard) {
-          let x = rect.left
-          if (rect.left + cardWidth > window.innerWidth)
-            x = window.innerWidth - cardWidth - 20
-          x = Math.max(10, x)
-          setPosition({ x, y: Math.min(rect.bottom + 10, window.innerHeight - 350) })
-          fetchDefinition(text)
+        const winW = window.innerWidth
+        const winH = window.innerHeight
+
+        if (showCardRef.current) {
+          setPosition(calculateCardPosition(rect, winW, winH))
+          fetchDefRef.current(text)
         } else {
-          // Trigger button: centered below the selection, with safe bounds
-          let x = rect.left + rect.width / 2
-          x = Math.max(26, Math.min(x, window.innerWidth - 26))
-          const y = Math.min(window.innerHeight - 48, rect.bottom + 12)
-          setPosition({ x, y })
+          setPosition(calculateButtonPosition(rect, winW, winH))
           setShowButton(true)
         }
       }, 50)
@@ -323,40 +409,39 @@ export default function PdfOverlay() {
       document.removeEventListener("keydown", handleKeyDown, true)
       document.removeEventListener("mouseup", handleMouseUp)
     }
-  }, [showCard, selectedText])
+  }, [])
 
   // Clickable word tokens for multi-word selections
-  const renderClickableTokens = (text: string) =>
-    text.split(/(\s+|[.,\/#!$%\^&\*;:{}=\-_`~()?]+)/).map((token, idx) => {
-      const isWord = /\w+/.test(token)
-      if (isWord) {
-        return (
+  const renderClickableTokens = (text: string) => {
+    const tokens = text.split(TOKEN_SPLIT_REGEX)
+    const elements = []
+    for (let idx = 0, len = tokens.length; idx < len; idx++) {
+      const token = tokens[idx]
+      if (WORD_TOKEN_REGEX.test(token)) {
+        elements.push(
           <span
             key={idx}
-            onClick={e => { e.stopPropagation(); setSelectedText(token); fetchDefinition(token) }}
-            className="plasmo-word-token"
-            style={{ cursor: "pointer", padding: "2px 6px", borderRadius: "6px", transition: "all 0.15s ease", display: "inline-block", backgroundColor: "rgba(255,255,255,0.03)" }}>
+            onClick={e => {
+              e.stopPropagation()
+              setSelectedText(token)
+              fetchDefinition(token)
+            }}
+            className="plasmo-word-token">
             {token}
           </span>
         )
+      } else {
+        elements.push(<span key={idx}>{token}</span>)
       }
-      return <span key={idx}>{token}</span>
-    })
+    }
+    return elements
+  }
 
-  const isMultiWord = selectedText.trim().split(/\s+/).length > 1
-  const t = THEMES[currentTheme] || THEMES[DEFAULT_THEME]
+  const isMultiWord = selectedText.trim().split(WHITESPACE_REGEX).length > 1
 
   return (
-    <div ref={containerRef} style={{ display: "contents", pointerEvents: "auto" }}>
-      <style dangerouslySetInnerHTML={{
-        __html: `
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
-        @keyframes plasmoFadeIn { from { opacity:0; transform:translateY(4px) scale(0.96); } to { opacity:1; transform:translateY(0) scale(1); } }
-        @keyframes pulseGlow { 0% { box-shadow: 0 0 0 0 rgba(134,239,172,0.4); } 70% { box-shadow: 0 0 0 6px rgba(134,239,172,0); } 100% { box-shadow: 0 0 0 0 rgba(134,239,172,0); } }
-        .dictionary-loader { width:18px; height:18px; border:2px solid rgba(255,255,255,0.15); border-radius:50%; border-top-color:#ffffff; animation:spin 0.8s linear infinite; display:inline-block; }
-        @keyframes spin { to { transform:rotate(360deg); } }
-        .plasmo-word-token:hover { background-color:#ffffff !important; color:#0F172A !important; }
-      ` }} />
+    <div style={CONTAINER_STYLE}>
+      <style dangerouslySetInnerHTML={{ __html: CSS_STYLES }} />
 
       {/* 1. Floating trigger button — position:fixed, viewport-relative */}
       {showButton && (
@@ -372,9 +457,14 @@ export default function PdfOverlay() {
             background: "linear-gradient(135deg, #86EFAC, #66bb8a)",
             border: "1px solid rgba(134,239,172,0.2)",
             color: "#0F172A",
-            width: "32px", height: "32px", borderRadius: "50%",
-            display: "flex", alignItems: "center", justifyContent: "center",
-            cursor: "pointer", zIndex: 2147483647,
+            width: "32px",
+            height: "32px",
+            borderRadius: "50%",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            cursor: "pointer",
+            zIndex: 2147483647,
             boxShadow: "0 4px 15px rgba(134,239,172,0.4)",
             animation: "plasmoFadeIn 0.15s cubic-bezier(0.16,1,0.3,1) forwards, pulseGlow 2s infinite",
             padding: "0",
@@ -400,11 +490,14 @@ export default function PdfOverlay() {
             WebkitBackdropFilter: "blur(16px)",
             border: "1px solid rgba(255,255,255,0.2)",
             color: "#F8FAFC",
-            padding: "16px", borderRadius: "16px",
-            zIndex: 2147483647, width: "320px",
+            padding: "16px",
+            borderRadius: "16px",
+            zIndex: 2147483647,
+            width: "320px",
             boxShadow: "0 20px 40px rgba(0,0,0,0.5)",
-            fontFamily: "'Inter', system-ui, -apple-system, sans-serif",
-            fontSize: "13px", lineHeight: "1.5",
+            fontFamily: "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
+            fontSize: "13px",
+            lineHeight: "1.5",
             animation: "plasmoFadeIn 0.2s cubic-bezier(0.16,1,0.3,1) forwards",
             pointerEvents: "auto"
           }}>
